@@ -1,0 +1,145 @@
+name: Execute ML lab notebooks
+
+on:
+  push:
+    paths:
+      - "datasets/**"
+      - "ex-*/*.ipynb"
+      - "Dataset/**"
+      - "*.csv"
+      - ".github/workflows/execute-notebooks.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: execute-ml-lab-notebooks
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install nbconvert ipykernel
+
+      - name: Prepare datasets in paths expected by original programs
+        run: |
+          set -euo pipefail
+          mkdir -p Dataset
+          cp datasets/titanic.csv Dataset/titanic.csv
+          cp datasets/Salary.csv Dataset/Salary.csv
+          cp datasets/Housing.csv Dataset/Housing.csv
+          cp datasets/Housing.csv Housing.csv
+          cp datasets/fish.csv Dataset/fish.csv
+          cp datasets/heart_disease_dataset.csv heart_disease_dataset.csv
+          echo "Dataset files prepared:"
+          ls -l Dataset Housing.csv heart_disease_dataset.csv
+          echo "Workspace: $GITHUB_WORKSPACE"
+
+      - name: Execute notebooks and save outputs
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p executed-notebooks
+          failures=0
+          executed=0
+
+          while IFS= read -r notebook; do
+            folder="$(basename "$(dirname "$notebook")")"
+            output="${folder}.ipynb"
+            echo "Executing $notebook with cwd=$GITHUB_WORKSPACE"
+            if (cd "$GITHUB_WORKSPACE" && jupyter nbconvert --to notebook --execute "$GITHUB_WORKSPACE/$notebook" \
+              --output "$output" --output-dir "$GITHUB_WORKSPACE/executed-notebooks" \
+              --ExecutePreprocessor.timeout=600); then
+              cp "executed-notebooks/$output" "$notebook"
+              echo "SUCCESS: $notebook"
+              printf -- '- Passed: `%s`\n' "$folder" >> "$GITHUB_STEP_SUMMARY"
+              executed=$((executed + 1))
+            else
+              echo "FAILED: $notebook"
+              printf -- '- **Failed:** `%s` (see job logs)\n' "$folder" >> "$GITHUB_STEP_SUMMARY"
+              failures=$((failures + 1))
+            fi
+          done < <(find ex-* -maxdepth 1 -type f -name '*.ipynb' -print | sort)
+
+          {
+            echo ""
+            echo "### Notebook execution summary"
+            echo "- Executed successfully: $executed"
+            echo "- Failed: $failures"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( executed == 0 )); then
+            echo "No notebooks were executed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if (( failures > 0 )); then
+            exit 1
+          fi
+
+      - name: Commit executed notebooks with outputs
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Remember the exact source revision these notebooks were executed from.
+          source_sha="$(git rev-parse HEAD)"
+
+          for attempt in 1 2 3; do
+            echo "Push attempt $attempt/3: fetching latest main..."
+            git fetch origin main
+
+            # Never publish outputs generated from stale notebooks over newer source.
+            if git diff --name-only "$source_sha" origin/main -- 'ex-*/*.ipynb' | grep -q .; then
+              echo "Notebook sources changed on origin/main while execution was running."
+              echo "Keeping the executed notebooks in the workflow artifact instead of overwriting newer source."
+              exit 0
+            fi
+
+            # Move the local branch to the latest remote commit while preserving
+            # the generated notebook files in the working tree.
+            git reset --mixed origin/main
+            git add ex-*/*.ipynb
+
+            if git diff --cached --quiet; then
+              echo "No notebook output changes to commit."
+              exit 0
+            fi
+
+            git commit -m "Add executed notebook outputs"
+            if git push origin HEAD:main; then
+              echo "Executed notebook outputs pushed successfully."
+              exit 0
+            fi
+
+            echo "Push raced with another update; retrying after fetching main..."
+          done
+
+          echo "Could not push notebook outputs after 3 attempts. The artifact is still available."
+          exit 1
+
+      - name: Upload executed notebooks as downloadable artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: executed-machine-learning-notebooks
+          path: executed-notebooks/
+          if-no-files-found: warn
+          retention-days: 14
